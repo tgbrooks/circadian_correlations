@@ -9,17 +9,16 @@ N = 500
 t = numpy.linspace(0,2 * numpy.pi, N)
 scores = numpy.random.normal(size=N)
 simd = numpy.concatenate([
-    #[10*scores],
-    [numpy.cos(t) * scores*5 + 10*scores],
-    [numpy.sin(t) * scores*5 + 10*scores],
+    [numpy.cos(t/2) * scores*15],
+    [numpy.sin(t/2) * scores*15],
     numpy.random.normal(size=(1,N))*5,
-    numpy.random.normal(size=(50,N)),
+    numpy.random.normal(size=(20,N)),
 ], axis=0).T
 
 def low_rank_loadings(X, r):
     ''' give best rank r loadings to approximation X '''
-    u,d,vt = numpy.linalg.svd(X, full_matrices=False)
-    #return u[:,:r] @ numpy.diag(d[:r]) @ vt[:r,:]
+    u,d,vt = jnp.linalg.svd(X, full_matrices=False)
+    #return u[:,:r] @ jnp.diag(d[:r]) @ vt[:r,:]
     return vt[:r,:].T
 
 def expm_AATv(A, v, nterms=15):
@@ -91,8 +90,8 @@ def resid(A, B, C, L0, X, times):
 
 def jax_circ_pca_scipy(X, times, r):
     n,k = X.shape
-    #N = k*r - (r*(r+1)//2) # Num free vars per matrix
-    N = (k-r)*r
+    N = k*r - (r*(r+1)//2) # Num free vars per matrix
+    #N = (k-r)*r
     times = jnp.asarray(times)
     L0 = jnp.asarray(low_rank_loadings(X, r))
     X = jnp.asarray(X)
@@ -102,13 +101,13 @@ def jax_circ_pca_scipy(X, times, r):
         B_ = vars[  N: 2*N]
         C_ = vars[2*N: 3*N]
         # Convert to rectangular lower triangular matrices
-        #idxs = jnp.tril_indices(n=k, k=-1, m=r)
-        #Atri = jnp.zeros((k,r)).at[idxs].set(A_)
-        #Btri = jnp.zeros((k,r)).at[idxs].set(B_)
-        #Ctri = jnp.zeros((k,r)).at[idxs].set(C_)
-        Atri = jnp.concatenate([numpy.zeros((r,r)), A_.reshape((-1,r))], axis=0)
-        Btri = jnp.concatenate([numpy.zeros((r,r)), B_.reshape((-1,r))], axis=0)
-        Ctri = jnp.concatenate([numpy.zeros((r,r)), C_.reshape((-1,r))], axis=0)
+        idxs = jnp.tril_indices(n=k, k=-1, m=r)
+        Atri = jnp.zeros((k,r)).at[idxs].set(A_)
+        Btri = jnp.zeros((k,r)).at[idxs].set(B_)
+        Ctri = jnp.zeros((k,r)).at[idxs].set(C_)
+        #Atri = jnp.concatenate([jnp.zeros((r,r)), A_.reshape((-1,r))], axis=0)
+        #Btri = jnp.concatenate([jnp.zeros((r,r)), B_.reshape((-1,r))], axis=0)
+        #Ctri = jnp.concatenate([jnp.zeros((r,r)), C_.reshape((-1,r))], axis=0)
         return Atri, Btri, Ctri
     @jax.jit
     def f(vars):
@@ -117,10 +116,10 @@ def jax_circ_pca_scipy(X, times, r):
     def pr(vars):
         A,B,C = extract(vars)
         print(eval(A,B,C, L0, X, times)[0])
-    x0 = numpy.concatenate([
-        numpy.zeros(N),
-        numpy.zeros(N),
-        numpy.zeros(N),
+    x0 = jnp.concatenate([
+        jnp.zeros(N),
+        jnp.zeros(N),
+        jnp.zeros(N),
     ])
     #res = jax.scipy.optimize.minimize(
     #    f,
@@ -139,7 +138,7 @@ def jax_circ_pca_scipy(X, times, r):
         options = {"gtol": 1e-2, "maxiter": 100},
     )
     return (L0, *extract(res.x),res)
-L0, A, B, C, res = jax_circ_pca_scipy(simd, t, 2)
+#L0, A, B, C, res = jax_circ_pca_scipy(simd, t, 2)
 
 def jax_circ_pca(X, times, r):
     # By-hand optimizer for the parametrized PCA
@@ -147,11 +146,13 @@ def jax_circ_pca(X, times, r):
         # Return the lower triangular version
         idxs = jnp.tril_indices(n=k, k=-1, m=r)
         return jnp.zeros((k,r)).at[idxs].set(mat)
+        #return jnp.concatenate([jnp.zeros((r,r)), mat.reshape((k-r,r))])
     n,k = X.shape
     times = jnp.asarray(times)
     L0 = jnp.asarray(low_rank_loadings(X, r))
     X = jnp.asarray(X)
     N = k*r - (r*(r+1)//2) # Num free vars per matrix
+    #N = k*r - r*r
     def f(A,B,C):
         Atri = extract(A, k, r)
         Btri = extract(B, k, r)
@@ -188,8 +189,8 @@ def jax_circ_pca(X, times, r):
     A,B,C = jnp.zeros(N), jnp.zeros(N), jnp.zeros(N)
     m = [jnp.zeros(N) for i in range(3)]
     v = [jnp.zeros(N) for i in range(3)]
-    for i in range(500):
+    for i in range(1500):
         A,B,C,m, v, res = update(A,B,C, m ,v, i+1)
         print(i, float(res))
     return (L0, extract(A, k, r), extract(B, k, r), extract(C, k, r), res)
-#L0, A, B, C, res = jax_circ_pca(simd, t, 1)
+L0, A, B, C, res = jax_circ_pca(simd, t, 2)
