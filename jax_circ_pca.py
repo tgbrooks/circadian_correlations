@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import Union
 from dataclasses import dataclass
 import textwrap
 import jax
@@ -8,17 +9,67 @@ import scipy.optimize
 import scipy.linalg
 import numpy
 
-## EXAMPLE DATA
-numpy.random.seed(0)
-N = 500
-t = numpy.linspace(0,2 * numpy.pi, N)
-scores = numpy.random.normal(size=N)
-simd = numpy.concatenate([
-    [numpy.cos(t/2) * scores*5 + scores * 10],
-    [numpy.sin(t/2) * scores*5 + scores * 10],
-    numpy.random.normal(size=(1,N))*5,
-    numpy.random.normal(size=(20,N)),
-], axis=0).T
+def compute_circ_pca(data, time, r, R = None, verbose=False):
+    '''
+    Compute the optimal r-dimensional subspace that captures the maximum
+    variation in X, which is allowed to vary according to `times` by
+
+    W(t) = exp(A cos(t) + B sin(t) + C) W0
+
+    where W0 is the rank r PCA estimate of weights,
+    W(t) is the weightings for the r-dimensional subspace at time t,
+    A, B, C are skew-symmetric matrices of rank r,
+    (specifically they are zero outside of the first r rows and columns,
+    and so are parametrized as just n x r matrices)
+    and exp() is the matrix exponential function.
+
+    verbose: if True, print out during iterations
+    R: number of dimensions to reduce to (via PCA) prior to performing circ PCA analysis.
+        Set this to lower numbers (<100) to speed up large datasets, if they are well-captured
+        by a PCA of this dimension.
+        If None, then no reduction is performed
+
+    returns: a CircPCA instance
+    '''
+
+    data = jnp.array(data)
+    time = jnp.array(time)
+
+    assert data.shape[0] == len(time), f"Expected data and time to have the same number of rows, instead had {data.shape[0]} and {len(time)}"
+    assert r > 0
+    N,k = data.shape
+
+    if k > 100 and R is None:
+        print(f"Warning: large number of columns may make this procedure slow. Recommended to use parameter R < 100 to reduce first")
+
+    if 3 * r >= N:
+        raise ValueError(f"Requested dimension r={r} is too high for the provided number of observations N={N}. Must have 3r < N")
+    if 3 * r >= k:
+        raise ValueError(f"Requested dimension r={r} is too high for the provided number of variables k={k}. Must have 3r < k")
+
+    
+    if R is not None:
+        if 3 * r >= R:
+            raise ValueError(f"Requested dimension r={r} is too high for the provided number of reduced variables R={R}. Must have 3r < R")
+        if R > k:
+            raise ValueError(f"Requested reduction to R={R} dimensions canot be higher than the provided number of variables k={k}.")
+
+        # Reduce to the specific number of variables first before
+        # performing Circ PCA
+        reduction_weights = low_rank_weights(data, R)
+        reduced_data = data @ reduction_weights
+    else:
+        reduced_data = data
+
+    # Perform the actual circ PCA
+    result = jax_circ_pca(reduced_data, time, r, verbose=verbose)
+
+    if R is not None:
+        # Correct the result CircPCA object to describe the dimension reduction performed
+        result.nvars = k
+        result.reduction_weights = reduction_weights
+
+    return result
 
 def low_rank_weights(X, r):
     ''' give best rank r weights to approximate X '''
@@ -31,6 +82,8 @@ def expm_AATv(A, v, nterms=15):
     where B = A - A.T is a large (sparse) square matrix with A on the left
     and A.T on the top, zeros in the bottom left block
     Assumes A and v have the same shape
+    Much faster than doing jnp.scipy.linalg.exp(A - A.T) @ V for tall matrices
+    due to not having to compute the nxn matrix exponential
     '''
     r = v.shape[1]
     res = v # first term of Taylor expansion
@@ -44,27 +97,11 @@ def expm_AATv(A, v, nterms=15):
     return res
 expm_AATv = jax.jit(expm_AATv, static_argnums=2)
 
-def expm_v(A, v, nterms=15):
-    ''' Compute exp(A) v by Taylor expansion 
-    
-    Much faster for large A than jax.scipy.linalg.expm
-    Also works for matrices v, best if tall not wide
-    '''
-    expAv = v # exp(A) v - starts with I v = v
-    Akv = v # A^k v/k! - starts at v
-    for k in range(1,nterms):
-        Akv = A @ Akv / k
-        expAv += Akv
-    return expAv
-expm_v = jax.jit(expm_v, static_argnums=2)
-
 @jax.jit
 def eval(A, B, C, W0, X, times):
     def func(i, ssr):
         x = X[[i],:]
         t = times[i]
-        #L = jax.scipy.linalg.expm(jnp.cos(t) * A + jnp.sin(t) * B + C) @ W0
-        #L = expm_v(jnp.cos(t) * A + jnp.sin(t) * B + C, W0)
         L = expm_AATv(jnp.cos(t) * A + jnp.sin(t) * B + C, W0)
         return ssr + jnp.linalg.norm(x - x @ L @ L.T)**2
     ssr = jax.lax.fori_loop(
@@ -75,75 +112,6 @@ def eval(A, B, C, W0, X, times):
     )
     return ssr / len(X)
 
-@jax.jit
-def resid(A, B, C, W0, X, times):
-    def func(ssr, xt):
-        x = xt[:-1]
-        t = xt[-1]
-        L = jax.scipy.linalg.expm(jnp.cos(t) * A + jnp.sin(t) * B + C) @ W0
-        resid = x - x @ L @ L.T
-        return ssr + jnp.linalg.norm(resid)**2, resid
-    xt = jnp.concatenate([X, times.reshape((-1,1))], axis=1)
-    ssr, resid = jax.lax.scan(
-        func,
-        init = jnp.asarray([0.]),
-        xs = xt,
-    )
-    return resid
-
-
-def jax_circ_pca_scipy(X, times, r):
-    n,k = X.shape
-    N = k*r - (r*(r+1)//2) # Num free vars per matrix
-    #N = (k-r)*r
-    times = jnp.asarray(times)
-    W0 = jnp.asarray(low_rank_weights(X, r))
-    X = jnp.asarray(X)
-    def extract(vars):
-        # Pull out our A,B,C matrices from a flattened vector
-        A_ = vars[  0:   N]
-        B_ = vars[  N: 2*N]
-        C_ = vars[2*N: 3*N]
-        # Convert to rectangular lower triangular matrices
-        idxs = jnp.tril_indices(n=k, k=-1, m=r)
-        Atri = jnp.zeros((k,r)).at[idxs].set(A_)
-        Btri = jnp.zeros((k,r)).at[idxs].set(B_)
-        Ctri = jnp.zeros((k,r)).at[idxs].set(C_)
-        #Atri = jnp.concatenate([jnp.zeros((r,r)), A_.reshape((-1,r))], axis=0)
-        #Btri = jnp.concatenate([jnp.zeros((r,r)), B_.reshape((-1,r))], axis=0)
-        #Ctri = jnp.concatenate([jnp.zeros((r,r)), C_.reshape((-1,r))], axis=0)
-        return Atri, Btri, Ctri
-    @jax.jit
-    def f(vars):
-        A, B, C = extract(vars)
-        return eval(A, B, C, W0, X, times)[0]
-    def pr(vars):
-        A,B,C = extract(vars)
-        print(eval(A,B,C, W0, X, times)[0])
-    x0 = jnp.concatenate([
-        jnp.zeros(N),
-        jnp.zeros(N),
-        jnp.zeros(N),
-    ])
-    #res = jax.scipy.optimize.minimize(
-    #    f,
-    #    x0 = x0,
-    #    method = "BFGS",
-    #    tol = 1e-2,
-    #    options = {"gtol": 1e-2},
-    #)
-    res = scipy.optimize.minimize(
-        f,
-        x0,
-        jac = jax.jacrev(f),
-        callback = pr,
-        method = "BFGS",
-        tol = 1e-2,
-        options = {"gtol": 1e-2, "maxiter": 100},
-    )
-    return (W0, *extract(res.x),res)
-#W0, A, B, C, res = jax_circ_pca_scipy(simd, t, 2)
-
 @dataclass
 class CircPCA:
     '''
@@ -151,19 +119,20 @@ class CircPCA:
     '''
 
     # Values used to fit
-    data: jnp.array
-    time: jnp.array
+    data: jnp.ndarray
+    time: jnp.ndarray
 
     r: int # Rank of reduction
-    n: int # number of observations
+    nobs: int # number of observations
+    nvars: int # number of variables measured per observation
 
     # Results
     # PCA of the data
-    W0: jnp.array
+    W0: jnp.ndarray
     # The circadian terms:
-    A: jnp.array
-    B: jnp.array
-    C: jnp.array
+    A: jnp.ndarray
+    B: jnp.ndarray
+    C: jnp.ndarray
 
     # sum-of-squares of residuals of the
     # projection to the given subspace
@@ -174,44 +143,57 @@ class CircPCA:
 
     # Convergence info
     niter: int # number of iterations
-    RSS_history: jnp.array # list of RSS during the fit, to check for convergence
-    
+    RSS_history: jnp.ndarray # list of RSS during the fit, to check for convergence
+
+    # Reduction to lower dimension prior to circ PCA info:
+    nvars_reduced: int # number of variables reduced to by PCA before performing circ PCA
+    reduction_weights: Union[jnp.ndarry, None] #Weights of the original variables used to perform the reduction
 
     def weights(self, t):
         ''' return n x r matrix of weights at time t
         
         t in radians'''
-        return expm_AATv(self.A * jnp.cos(t) + self.B * jnp.sin(t) + self.C, self.W0)
+        w = expm_AATv(self.A * jnp.cos(t) + self.B * jnp.sin(t) + self.C, self.W0)
+        if self.reduction_weights is not None:
+            return self.reduction_weights @ w
+        return w
 
-    def angles(self, ts = jnp.linspace(0,2*jnp.pi, 31)):
+    def angles(self, ts = jnp.linspace(0,2*jnp.pi, 31), from_mat=None):
         ''' Compute the angles between the r-dimensional subspace at time t
         compared to that at time 0.
+
+        from_mat: matrix to obtain angles with respect to. If None (default),
+                    then this will be the t=0 matrix
         '''
         weights = [self.weights(t) for t in ts]
-        angles = jnp.array([scipy.linalg.subspace_angles(Wt, weights[0])
+        if from_mat is None:
+            from_mat = weights[0]
+        angles = jnp.array([scipy.linalg.subspace_angles(Wt, from_mat)
                                 for Wt in weights])
         return angles, ts
 
     def summary(self):
         angles, ts = self.angles()
+        angles_from_W0, ts = self.angles(self.W0)
         ''' Summarize the results of the structure '''
         return textwrap.dedent(f'''
         Circadian PCA results:
         W(t) = exp(A cos(t) + B sin(t) + C) W0
 
-        nobs: {self.data.shape[0]}  nvars: {self.data.shape[1]}
+        nobs: {self.data.shape[0]}  nvars: {self.nvars} reduced to nvars: {self.nvars_reduced}
         rank r: {self.r}
 
         niter: {self.niter}
              PCA RSS: {self.PCA_resid_sum_squares:0.3f}
         CIRC PCA RSS: {self.resid_sum_squares:0.3f}
 
-        FROBENIUS NORMS:
-        |A| = {jnp.linalg.norm(self.A)**2:0.3f}\t|B| = {jnp.linalg.norm(self.B)**2:0.3f}\t|C| = {jnp.linalg.norm(self.C)**2:0.3f}
+        L-infinity NORMS:
+        |A| = {jnp.linalg.norm(self.A, ord=float('inf'))**2:0.3f}\t|B| = {jnp.linalg.norm(self.B, ord=float('inf'))**2:0.3f}\t|C| = {jnp.linalg.norm(self.C, ord=float('inf'))**2:0.3f}
         LARGEST ANGLE FROM t=0: {jnp.max(angles):0.3f}
+        LARGEST ANGLE FROM W0: {jnp.max(angles_from_W0):0.3f}
         ''').strip()
 
-def jax_circ_pca(X, times, r):
+def jax_circ_pca(X, times, r, verbose=False):
     """
     Compute the optimal r-dimensional subspace that captures the maximum
     variation in X, which is allowed to vary according to `times` by
@@ -234,15 +216,15 @@ def jax_circ_pca(X, times, r):
     # By-hand optimizer for the parametrized PCA
     def extract(mat, k, r):
         # Return the lower triangular version
-        idxs = jnp.tril_indices(n=k, k=-1, m=r)
-        return jnp.zeros((k,r)).at[idxs].set(mat)
-        #return jnp.concatenate([jnp.zeros((r,r)), mat.reshape((k-r,r))])
+        #idxs = jnp.tril_indices(n=k, k=-1, m=r)
+        #return jnp.zeros((k,r)).at[idxs].set(mat)
+        return jnp.concatenate([jnp.zeros((r,r)), mat.reshape((k-r,r))])
     n,k = X.shape
     times = jnp.asarray(times)
     W0 = jnp.asarray(low_rank_weights(X, r))
     X = jnp.asarray(X)
-    N = k*r - (r*(r+1)//2) # Num free vars per matrix
-    #N = k*r - r*r
+    #N = k*r - (r*(r+1)//2) # Num free vars per matrix
+    N = k*r - r*r
     def f(A,B,C):
         Atri = extract(A, k, r)
         Btri = extract(B, k, r)
@@ -284,20 +266,38 @@ def jax_circ_pca(X, times, r):
     for i in range(1500):
         A,B,C,m, v, res = update(A,B,C, m ,v, i+1)
         resids.append(res)
-        if (i % 20) == 0:
+        if (i % 20) == 0 and verbose:
             print(f"{i}, RSS = {float(res):0.4f}")
-            print(f"\t|A| = {jnp.linalg.norm(A)}, |B| = {jnp.linalg.norm(B)}, |C| = {jnp.linalg.norm(C)}")
+            print(f"\t|A| = {jnp.linalg.norm(A, float('inf'))**2:0.3f}\t|B| = {jnp.linalg.norm(B, float('inf'))**2:0.3f}\t|C| = {jnp.linalg.norm(C, float('inf'))**2:0.3f}")
     Atri = extract(A, k, r)
     Btri = extract(B, k, r)
     Ctri = extract(C, k, r)
     result = CircPCA(
         X, times,
         r, n,
+        k,
         W0, Atri, Btri, Ctri,
         resid_sum_squares = res,
         PCA_resid_sum_squares = PCA_resid_sum_squares,
         niter = i+1,
         RSS_history = jnp.array(resids),
+        nvars_reduced = k,
+        reduction_weights = None,
     )
     return result
-result = jax_circ_pca(simd, t, 2)
+
+if __name__ == '__main__':
+    ## EXAMPLE DATA
+    numpy.random.seed(0)
+    N = 500
+    t = numpy.linspace(0,2 * numpy.pi, N)
+    scores = numpy.random.normal(size=N)
+    simd = numpy.concatenate([
+        [numpy.cos(t/2) * scores*5 + scores * 10],
+        [numpy.sin(t/2) * scores*5 + scores * 10],
+        numpy.random.normal(size=(1,N))*5,
+        numpy.random.normal(size=(100,N)),
+    ], axis=0).T
+
+    result = compute_circ_pca(simd, t, 2, R = 10, verbose=True)
+    print(result.summary())
