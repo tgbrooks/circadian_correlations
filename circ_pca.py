@@ -4,6 +4,8 @@ import textwrap
 
 import numpy as np
 import scipy.linalg
+import scipy.cluster.hierarchy
+import statsmodels.api as sm
 
 @dataclass
 class CircPCA:
@@ -67,7 +69,7 @@ class CircPCA:
 
     def summary(self):
         angles, ts = self.angles()
-        angles_from_W0, ts = self.angles(self.W0)
+        angles_from_W0, ts = self.angles(expm_AATv(self.C, self.W0))
         ''' Summarize the results of the structure '''
         return textwrap.dedent(f'''
         Circadian PCA results:
@@ -83,8 +85,8 @@ class CircPCA:
         L-infinity NORMS:
         |A| = {np.linalg.norm(self.A, ord=float('inf'))**2:0.3f}\t|B| = {np.linalg.norm(self.B, ord=float('inf'))**2:0.3f}\t|C| = {np.linalg.norm(self.C, ord=float('inf'))**2:0.3f}
         LARGEST ANGLE FROM t=0: {np.max(angles):0.3f}
-        LARGEST ANGLE FROM W0: {np.max(angles_from_W0):0.3f}
-        AVERAGE ANGLE FROM W0: {np.mean(angles_from_W0[:,0]):0.3f}
+        LARGEST ANGLE FROM exp(C)W0: {np.max(angles_from_W0):0.3f}
+        AVERAGE ANGLE FROM exp(C)W0: {np.mean(angles_from_W0[:,0]):0.3f}
         ''').strip()
 
     def plot(self):
@@ -95,8 +97,81 @@ class CircPCA:
         import pylab
         fig, ax = pylab.subplots()
         ax.imshow(total_weight_by_time.T)
-        ax.xlabel('time')
-        ax.ylabel('variable')
+        ax.set_xlabel('time')
+        ax.set_ylabel('variable')
+        return fig
+
+    def plot_residuals(self):
+        ''' Plot versus time the residuals of the projection '''
+        import pylab
+        PCA_weights = self.reduction_weights @ self.W0
+        residuals = []
+        pca_residuals = []
+        for t, row in zip(self.time, self.data):
+            W = self.weights(t)
+            # Residuals from Circ PCA
+            projection = row @ W @ W.T
+            residual = np.linalg.norm(row - projection)**2
+            residuals.append(residual)
+            # Standard PCA residuals
+            pca_projection = row @ PCA_weights @ PCA_weights.T
+            pca_residual = np.linalg.norm(row - pca_projection)**2
+            pca_residuals.append(pca_residual)
+        fig, ax = pylab.subplots(figsize=(6,6))
+        ax.scatter(
+            self.time % 24,
+            residuals,
+        )
+        fit_t =  np.linspace(0,24,25)
+        loess_fit = sm.nonparametric.lowess(
+            residuals,
+            self.time,
+            xvals = fit_t,
+        )
+        ax.plot(fit_t, loess_fit, label="CircPCA")
+
+        ax.scatter(
+            self.time % 24,
+            pca_residuals,
+        )
+        fit_t =  np.linspace(0,24,25)
+        pca_loess_fit = sm.nonparametric.lowess(
+            pca_residuals,
+            self.time,
+            xvals = fit_t,
+        )
+        ax.plot(fit_t, pca_loess_fit, label="PCA")
+        ax.set_ylim(0)
+        ax.set_xticks(np.arange(0,25, 3))
+        return fig
+
+    def plot_RSS_history(self):
+        import pylab
+        fig, ax = pylab.subplots()
+        ax.plot(
+            self.RSS_history
+        )
+        ax.set_xlabel("Iteration count")
+        ax.set_ylabel("Residual Sum of Squares")
+        return fig
+
+    def plot_corr(self):
+        ts = np.linspace(0,24,25)
+        weights = [self.weights(t) for t in ts]
+        linkage = scipy.cluster.hierarchy.linkage(self.data.T, metric="correlation")
+        leaves_list = scipy.cluster.hierarchy.leaves_list(linkage)
+
+        import pylab
+        fig, axes = pylab.subplots(figsize=(10,6), ncols=2, sharex=True, sharey=True)
+        corr = weights[0][:,[0]] @ weights[0][:,[0]].T
+        axes[0].imshow(
+            corr[leaves_list][:,leaves_list]
+        )
+        corr = weights[12][:,[0]] @ weights[0][:,[0]].T
+        axes[1].imshow(
+            corr[leaves_list][:,leaves_list]
+        )
+        return fig
 
 def expm_AATv(A, v, nterms=15):
     ''' Given A, a lower triangular (rectangular) matrix and a tall matrix v
@@ -177,6 +252,7 @@ def compute_circ_pca(data, time, r, R = None, verbose=False):
     if R is not None:
         # Correct the result CircPCA object to describe the dimension reduction performed
         result.nvars = k
+        result.data = data
         result.reduction_weights = reduction_weights
 
     return result
