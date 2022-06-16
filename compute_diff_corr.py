@@ -1,5 +1,6 @@
 import pathlib
 import pandas
+import random
 import numpy
 import pylab
 import seaborn as sns
@@ -41,7 +42,7 @@ gene_list = [
     'ENSMUSG00000020889',
     'ENSMUSG00000021775'
 ]
-#gene_list = X.columns
+gene_list = X.columns #WARNING: far too lage, will never complete
 
 
 fam = sm.families.Gaussian()
@@ -56,8 +57,8 @@ def main_model(geneA, geneB, data):
         "time": times,
         "cos": cos,
         "sin": sin,
-        "cos2": cos2,
-        "sin2": sin2,
+        #"cos2": cos2,
+        #"sin2": sin2,
         "sample": data.iloc[:,1:].columns,
     })
     d = d[~d['sample'].isin(outlier_samples)]
@@ -65,7 +66,7 @@ def main_model(geneA, geneB, data):
     d['Y'] -= d.Y.mean()
 
     res = smf.gee(
-        "Y ~ 1 + X + (sin2 + cos2) + (sin + cos)*X",
+        "Y ~ 1 + X + (sin + cos)*X",
         groups = "study",
         data = d,
         family = fam,
@@ -78,24 +79,34 @@ def main_model(geneA, geneB, data):
 
 # Compute the fits for the selected genes
 data_selected = data.loc[gene_list]
+gene_pairs = [(a,b) for a in gene_list for b in gene_list]
+random.seed(0)
+random.shuffle(gene_pairs)
 results_list = []
-for geneA in gene_list:
-    for geneB in gene_list:
-        if geneA == geneB:
-            continue
+num_significant = 0
+num_run = 0
+for geneA, geneB in gene_pairs:
+    if geneA == geneB:
+        continue
 
-        res, d = main_model(geneA,geneB, data_selected)
+    res, d = main_model(geneA,geneB, data_selected)
 
-        results_list.append({
-            "geneA": geneA,
-            "geneB": geneB,
-            "symbolA": data_selected.loc[geneA].Symbol,
-            "symbolB": data_selected.loc[geneB].Symbol,
-            "X": res.params["X"],
-            "sin:X": res.params["sin:X"],
-            "cos:X": res.params["cos:X"],
-            "corr_diff_p": res.f_test("sin:X = 0, cos:X = 0").pvalue
-        })
+    res_summary = {
+        "geneA": geneA,
+        "geneB": geneB,
+        "symbolA": data_selected.loc[geneA].Symbol,
+        "symbolB": data_selected.loc[geneB].Symbol,
+        "X": res.params["X"],
+        "sin:X": res.params["sin:X"],
+        "cos:X": res.params["cos:X"],
+        "corr_diff_p": res.f_test("sin:X = 0, cos:X = 0").pvalue
+    }
+    results_list.append(res_summary)
+    if res_summary['corr_diff_p'] < 1e-2:
+        num_significant += 1
+    num_run += 1
+    if num_run % 1000 == 0:
+        print(num_run, num_significant)
 results = pandas.DataFrame(results_list)
 
 def plot_genes(A, B):
@@ -120,54 +131,54 @@ def plot_genes(A, B):
     )
     fig.set(xlabel=symbolA, ylabel=symbolB)
 
-    res_reduced_Y = smf.gee(
-        "Y ~ 1 + sin + cos + sin2 + cos2",
-        groups = "study",
-        data = d,
-        family = fam,
-        cov_struct = ind
-    ).fit()
-    res_reduced_X = smf.gee(
-        "X ~ 1 + sin + cos + sin2 + cos2",
-        groups = "study",
-        data = d,
-        family = fam,
-        cov_struct = ind
-    ).fit()
+    #res_reduced_Y = smf.gee(
+    #    "Y ~ 1 + sin + cos + sin2 + cos2",
+    #    groups = "study",
+    #    data = d,
+    #    family = fam,
+    #    cov_struct = ind
+    #).fit()
+    #res_reduced_X = smf.gee(
+    #    "X ~ 1 + sin + cos + sin2 + cos2",
+    #    groups = "study",
+    #    data = d,
+    #    family = fam,
+    #    cov_struct = ind
+    #).fit()
 
 
-    #estimated interaction plot
-    fig, (ax) = pylab.subplots()
-    t = numpy.linspace(0,24,25)
-    cost = numpy.cos(t * 2 * numpy.pi / 24) 
-    sint = numpy.sin(t * 2 * numpy.pi / 24) 
-    cos2t = numpy.cos(2 * t * 2 * numpy.pi / 24) 
-    sin2t = numpy.sin(2 * t * 2 * numpy.pi / 24) 
-    LARGE = 1e6
-    ax.plot(
-        t,
-        #fit['X'] + fit['cos:X'] * cost + fit['sin:X'] * sint,
-        #fit['X'] + fit['cos:X'] * cost + fit['sin:X'] * sint + fit['cos2:X'] * cos2t + fit['sin2:X'] * sin2t,
-        # NOTE: we multiple and divide by LARGE so that non-interaction effects (i.e., without X) are made negligible
-        res.predict(
-            {"X": LARGE * numpy.ones(len(t)), "cos": cost, "sin": sint, "cos2": cos2t, "sin2": sin2t}
-        ) / LARGE,
-        label="estimated corr"
-    )
-    ax.axhline(0, color='k')
-    ax.axhline(1, color='k')
-    # 'spurious' correlation from mean-value changes
-    # take derivatives of the two fit curves and if they move together, then we have 'spurious correlation'
-    derivA = -res_reduced_X.params['cos'] * sint + res_reduced_X.params['sin'] * cost - 2 * res_reduced_X.params['cos2'] *sin2t + 2* res_reduced_X.params['sin2'] * cos2t
-    derivB = -res_reduced_Y.params['cos'] * sint + res_reduced_Y.params['sin'] * cost - 2 * res_reduced_Y.params['cos2'] *sin2t + 2* res_reduced_Y.params['sin2'] * cos2t
-    fake_corr = derivA * derivB
-    ax.plot(
-        t,
-        fake_corr,
-        label="spurious correlation"
-    )
-    ax.set_xticks([0,4,8,12,16,20,24])
-    fig.legend()
+    ##estimated interaction plot
+    #fig, (ax) = pylab.subplots()
+    #t = numpy.linspace(0,24,25)
+    #cost = numpy.cos(t * 2 * numpy.pi / 24) 
+    #sint = numpy.sin(t * 2 * numpy.pi / 24) 
+    #cos2t = numpy.cos(2 * t * 2 * numpy.pi / 24) 
+    #sin2t = numpy.sin(2 * t * 2 * numpy.pi / 24) 
+    #LARGE = 1e6
+    #ax.plot(
+    #    t,
+    #    #fit['X'] + fit['cos:X'] * cost + fit['sin:X'] * sint,
+    #    #fit['X'] + fit['cos:X'] * cost + fit['sin:X'] * sint + fit['cos2:X'] * cos2t + fit['sin2:X'] * sin2t,
+    #    # NOTE: we multiple and divide by LARGE so that non-interaction effects (i.e., without X) are made negligible
+    #    res.predict(
+    #        {"X": LARGE * numpy.ones(len(t)), "cos": cost, "sin": sint, "cos2": cos2t, "sin2": sin2t}
+    #    ) / LARGE,
+    #    label="estimated corr"
+    #)
+    #ax.axhline(0, color='k')
+    #ax.axhline(1, color='k')
+    ## 'spurious' correlation from mean-value changes
+    ## take derivatives of the two fit curves and if they move together, then we have 'spurious correlation'
+    #derivA = -res_reduced_X.params['cos'] * sint + res_reduced_X.params['sin'] * cost - 2 * res_reduced_X.params['cos2'] *sin2t + 2* res_reduced_X.params['sin2'] * cos2t
+    #derivB = -res_reduced_Y.params['cos'] * sint + res_reduced_Y.params['sin'] * cost - 2 * res_reduced_Y.params['cos2'] *sin2t + 2* res_reduced_Y.params['sin2'] * cos2t
+    #fake_corr = derivA * derivB
+    #ax.plot(
+    #    t,
+    #    fake_corr,
+    #    label="spurious correlation"
+    #)
+    #ax.set_xticks([0,4,8,12,16,20,24])
+    #fig.legend()
 
     fig = sns.lmplot(
         x = "X",
