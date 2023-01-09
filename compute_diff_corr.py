@@ -76,7 +76,6 @@ def main_model(geneA, geneB, data):
 
     return res, d
 
-
 # Compute the fits for the selected genes
 data_selected = data.loc[gene_list]
 gene_pairs = [(a,b) for a in gene_list for b in gene_list]
@@ -111,13 +110,15 @@ results = pandas.DataFrame(results_list)
 
 def plot_genes(A, B):
     ''' Visualize the time-dependent correlation between the genes A and B '''
-    res, d = main_model(A, B, data)
-    fit = res.params
-
     symbolA = data.Symbol.loc[A]
     symbolB = data.Symbol.loc[B]
 
-    plot_d = d.copy()
+    plot_d = pandas.DataFrame({
+        "X": numpy.log10(data.iloc[:,1:].loc[A] + 0.01),
+        "Y": numpy.log10(data.iloc[:,1:].loc[B] + 0.01),
+        "time": times,
+        "study": studies,
+    })
     plot_d['time_bucket'] = pandas.cut((d.time % 24), numpy.linspace(0,24,7), right=False)
     plot_d['time24'] = plot_d.time %24
     fig = sns.lmplot(
@@ -130,6 +131,9 @@ def plot_genes(A, B):
         data = plot_d,
     )
     fig.set(xlabel=symbolA, ylabel=symbolB)
+
+    #res, d = main_model(A, B, data)
+    #fit = res.params
 
     #res_reduced_Y = smf.gee(
     #    "Y ~ 1 + sin + cos + sin2 + cos2",
